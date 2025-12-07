@@ -5,7 +5,7 @@
   </h1>
 </p>
 
-<p align="center">A learning project to build a vector database from scratch using **Zig** — exploring SIMD operations, similarity search algorithms, and database internals.
+<p align="center">A learning project to build a vector database from scratch using <span style="font-weight: bold">Zig</span> — exploring SIMD operations, similarity search algorithms, and database internals.</p>
 
 ## Overview
 
