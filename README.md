@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="Eloquence" src=".github/media/eloquence.jpg" width="450">
+  <img alt="Eloquence" src=".github/media/eloquence.jpg" width="650">
   <h1 align="center">
     Eloquence: Handmade Vector DB from scratch
   </h1>
