@@ -2,6 +2,11 @@ const std = @import("std");
 const print = std.debug.print;
 const eloquence = @import("eloquence");
 
+const Header = extern struct { magic: u32, version: u32, dim: u32, count: u64 };
+
+// "ELQ" + 0x01 (in hex) = 0x00514C45 (Depending on endianness, but let's just use a constant)
+const MAGIC_NUMBER: u32 = 0x514C4501;
+
 pub const DistanceMetric = enum {
     Cosine, // Normalize vectors and use dot product
     DotProduct, // Raw dot product without normalization
@@ -102,6 +107,28 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
             }
 
             return results;
+        }
+
+        pub fn save(self: *Self, path: []const u8) !void {
+            var file = try std.fs.cwd().createFile(path, .{});
+            defer file.close();
+
+            var writer = file.writer();
+
+            const header = Header{
+                .magic = MAGIC_NUMBER,
+                .version = 1,
+                .dim = @intCast(dim),
+                .count = self.ids.items.len,
+            };
+
+            try writer.writeAll(std.mem.asBytes(&header));
+
+            const vector_bytes = std.mem.sliceAsBytes(self.vectors.items);
+            try writer.writeAll(vector_bytes);
+
+            const id_bytes = std.mem.sliceAsBytes(self.ids.items);
+            try writer.writeAll(id_bytes);
         }
     };
 }
