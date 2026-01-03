@@ -1,6 +1,5 @@
 const std = @import("std");
 const print = std.debug.print;
-const eloquence = @import("eloquence");
 
 const Header = extern struct { magic: u32, version: u32, dim: u32, count: u64 };
 
@@ -113,8 +112,6 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
             var file = try std.fs.cwd().createFile(path, .{});
             defer file.close();
 
-            var writer = file.writer();
-
             const header = Header{
                 .magic = MAGIC_NUMBER,
                 .version = 1,
@@ -122,26 +119,84 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
                 .count = self.ids.items.len,
             };
 
-            try writer.writeAll(std.mem.asBytes(&header));
+            try file.writeAll(std.mem.asBytes(&header));
 
             const vector_bytes = std.mem.sliceAsBytes(self.vectors.items);
-            try writer.writeAll(vector_bytes);
+            try file.writeAll(vector_bytes);
 
             const id_bytes = std.mem.sliceAsBytes(self.ids.items);
-            try writer.writeAll(id_bytes);
+            try file.writeAll(id_bytes);
+        }
+
+        pub fn load(allocator: std.mem.Allocator, path: []const u8) !Self {
+            var file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+            defer file.close();
+
+            var header_bytes: [@sizeOf(Header)]u8 = undefined;
+            const header_read = try file.readAll(&header_bytes);
+            if (header_read != @sizeOf(Header)) {
+                return error.UnexpectedEndOfFile;
+            }
+
+            const header: *const Header = @ptrCast(@alignCast(&header_bytes));
+            if (header.magic != MAGIC_NUMBER) {
+                return error.InvalidFileFormat;
+            }
+            if (header.dim != dim) {
+                return error.DimensionMismatch;
+            }
+
+            const count: usize = @intCast(header.count);
+
+            var vectors: std.ArrayList(Vec) = .{};
+            try vectors.resize(allocator, count);
+
+            const vector_bytes = std.mem.sliceAsBytes(vectors.items);
+            const bytes_read = try file.readAll(vector_bytes);
+            if (bytes_read != vector_bytes.len) {
+                vectors.deinit(allocator);
+                return error.UnexpectedEndOfFile;
+            }
+
+            var ids: std.ArrayList(u64) = .{};
+            try ids.resize(allocator, count);
+
+            const id_bytes = std.mem.sliceAsBytes(ids.items);
+            const id_bytes_read = try file.readAll(id_bytes);
+            if (id_bytes_read != id_bytes.len) {
+                vectors.deinit(allocator);
+                ids.deinit(allocator);
+                return error.UnexpectedEndOfFile;
+            }
+
+            return Self{
+                .ids = ids,
+                .vectors = vectors,
+                .allocator = allocator,
+            };
         }
     };
 }
+
+const DB_PATH = "vectors.elq";
 
 pub fn main() !void {
     const dim = 128;
     const DB = VectorDB(dim, .Cosine);
 
+    var db: DB = undefined;
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var db = DB.init(allocator);
+    if (std.fs.cwd().access(DB_PATH, .{})) |_| {
+        print("Loading...\n", .{});
+        db = try DB.load(allocator, DB_PATH);
+    } else |_| {
+        print("Generating...\n", .{});
+        db = DB.init(allocator);
+    }
     defer db.deinit();
 
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
@@ -156,6 +211,9 @@ pub fn main() !void {
         try db.add(@intCast(i + 1), raw);
     }
 
+    print("Saving...\n", .{});
+    try db.save(DB_PATH);
+
     var query_raw: @Vector(dim, f32) = db.vectors.items[3999];
 
     for (0..dim) |j| {
@@ -169,4 +227,101 @@ pub fn main() !void {
     for (top_10, 1..) |result, rank| {
         print("Rank {} → id: {}, score: {d:.6}\n", .{ rank, result.id, result.score });
     }
+}
+
+test "save and load roundtrip" {
+    const allocator = std.testing.allocator;
+    const dim = 4;
+    const DB = VectorDB(dim, .Cosine);
+
+    var db = DB.init(allocator);
+    defer db.deinit();
+
+    try db.add(1, .{ 1.0, 0.0, 0.0, 0.0 });
+    try db.add(2, .{ 0.0, 1.0, 0.0, 0.0 });
+    try db.add(3, .{ 0.0, 0.0, 1.0, 0.0 });
+
+    const test_path = "test_db.elq";
+    try db.save(test_path);
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var loaded_db = try DB.load(allocator, test_path);
+    defer loaded_db.deinit();
+
+    try std.testing.expectEqual(3, loaded_db.ids.items.len);
+    try std.testing.expectEqual(3, loaded_db.vectors.items.len);
+
+    try std.testing.expectEqual(1, loaded_db.ids.items[0]);
+    try std.testing.expectEqual(2, loaded_db.ids.items[1]);
+    try std.testing.expectEqual(3, loaded_db.ids.items[2]);
+
+    for (0..dim) |i| {
+        try std.testing.expectApproxEqAbs(db.vectors.items[0][i], loaded_db.vectors.items[0][i], 1e-6);
+        try std.testing.expectApproxEqAbs(db.vectors.items[1][i], loaded_db.vectors.items[1][i], 1e-6);
+        try std.testing.expectApproxEqAbs(db.vectors.items[2][i], loaded_db.vectors.items[2][i], 1e-6);
+    }
+}
+
+test "load with invalid magic returns error" {
+    const allocator = std.testing.allocator;
+    const dim = 4;
+    const DB = VectorDB(dim, .Cosine);
+
+    const test_path = "test_invalid.elq";
+
+    {
+        var file = try std.fs.cwd().createFile(test_path, .{});
+        defer file.close();
+        const invalid_header = [_]u8{0} ** @sizeOf(Header);
+        try file.writeAll(&invalid_header);
+    }
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    const result = DB.load(allocator, test_path);
+    try std.testing.expectError(error.InvalidFileFormat, result);
+}
+
+test "load with dimension mismatch returns error" {
+    const allocator = std.testing.allocator;
+
+    const DB4 = VectorDB(4, .Cosine);
+    var db = DB4.init(allocator);
+    defer db.deinit();
+
+    try db.add(1, .{ 1.0, 0.0, 0.0, 0.0 });
+
+    const test_path = "test_dim_mismatch.elq";
+    try db.save(test_path);
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    const DB8 = VectorDB(8, .Cosine);
+    const result = DB8.load(allocator, test_path);
+    try std.testing.expectError(error.DimensionMismatch, result);
+}
+
+test "search on loaded database works correctly" {
+    const allocator = std.testing.allocator;
+    const dim = 4;
+    const DB = VectorDB(dim, .Cosine);
+
+    var db = DB.init(allocator);
+    defer db.deinit();
+
+    try db.add(1, .{ 1.0, 0.0, 0.0, 0.0 });
+    try db.add(2, .{ 0.9, 0.1, 0.0, 0.0 });
+    try db.add(3, .{ 0.0, 1.0, 0.0, 0.0 });
+
+    const test_path = "test_search.elq";
+    try db.save(test_path);
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var loaded_db = try DB.load(allocator, test_path);
+    defer loaded_db.deinit();
+
+    const results = try loaded_db.search(.{ 1.0, 0.0, 0.0, 0.0 }, 2);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(2, results.len);
+    try std.testing.expectEqual(1, results[0].id);
+    try std.testing.expectEqual(2, results[1].id);
 }
