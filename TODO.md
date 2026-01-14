@@ -5,7 +5,7 @@
 - [x] Cosine similarity search (dot product with normalization)
 - [x] Multiple distance metrics (Cosine, Dot Product, Euclidean)
 - [x] Persistence (save/load to disk)
-- [ ] Metadata storage & filtering
+- [x] Metadata storage & filtering
 
 ## Phase 2: Indexing (The heart of vector DBs)
 - [ ] IVF (Inverted File Index) - Clustering-based ANN

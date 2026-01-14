@@ -1,5 +1,6 @@
 const std = @import("std");
 const print = std.debug.print;
+const assert = std.debug.assert;
 
 const MAX_METADATA_PAIRS: usize = 16;
 const MAX_KEY_LEN: usize = 64;
@@ -87,7 +88,85 @@ fn matches_filter(metadata: []const MetadataPair, filter: []const Condition) boo
     return true;
 }
 
-const Header = extern struct { magic: u32, version: u32, dim: u32, count: u64 };
+const Header = extern struct {
+    magic: u32,
+    version: u32,
+    dim: u32,
+    _padding: u32,
+    count: u64,
+    offset_table_pos: u64,
+    blob_pos: u64,
+
+    comptime {
+        assert(@sizeOf(Header) == 40);
+        assert(@alignOf(Header) == 8);
+    }
+};
+
+const OffsetEntry = extern struct {
+    offset: u64,
+    length: u32,
+    _padding: u32,
+
+    comptime {
+        assert(@sizeOf(OffsetEntry) == 16);
+        assert(@alignOf(OffsetEntry) == 8);
+    }
+};
+
+fn serialize_metadata(writer: *std.io.Writer, metadata: []const MetadataPair) !void {
+    try writer.writeInt(u16, @intCast(metadata.len), .little);
+
+    for (metadata) |pair| {
+        try writer.writeInt(u8, @intCast(pair.key.len), .little);
+        try writer.writeAll(pair.key);
+
+        // value_type: 0 => boolean, 1 => integer, 2 => string
+        switch (pair.value) {
+            .boolean => |b| {
+                try writer.writeInt(u8, 0, .little);
+                try writer.writeInt(u8, @intFromBool(b), .little);
+            },
+            .integer => |i| {
+                try writer.writeInt(u8, 1, .little);
+                try writer.writeInt(i64, i, .little);
+            },
+            .string => |s| {
+                try writer.writeInt(u8, 2, .little);
+                try writer.writeInt(u16, @intCast(s.len), .little);
+                try writer.writeAll(s);
+            },
+        }
+    }
+}
+
+fn deserialize_metadata(reader: *std.io.Reader, allocator: std.mem.Allocator) ![]const MetadataPair {
+    const pair_count = try reader.takeInt(u16, .little);
+
+    const pairs = try allocator.alloc(MetadataPair, pair_count);
+
+    for (pairs) |*pair| {
+        const key_len = try reader.takeInt(u8, .little);
+        const key = try allocator.alloc(u8, key_len);
+        try reader.readSliceAll(key);
+        pair.key = key;
+
+        const value_type = try reader.takeInt(u8, .little);
+        pair.value = switch (value_type) {
+            0 => .{ .boolean = try reader.takeInt(u8, .little) != 0 },
+            1 => .{ .integer = try reader.takeInt(i64, .little) },
+            2 => blk: {
+                const str_len = try reader.takeInt(u16, .little);
+                const str = try allocator.alloc(u8, str_len);
+                try reader.readSliceAll(str);
+                break :blk .{ .string = str };
+            },
+            else => return error.InvalidMetadataValueType,
+        };
+    }
+
+    return pairs;
+}
 
 // "ELQ" + 0x01 (in hex) = 0x00514C45 (Depending on endianness, but let's just use a constant)
 const MAGIC_NUMBER: u32 = 0x514C4501;
@@ -277,20 +356,47 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
             var file = try std.fs.cwd().createFile(path, .{});
             defer file.close();
 
+            const count = self.vectors.items.len;
+
+            var allocating = std.io.Writer.Allocating.init(self.allocator);
+            defer allocating.deinit();
+
+            var offsets = try self.allocator.alloc(OffsetEntry, count);
+            defer self.allocator.free(offsets);
+
+            for (self.metadatas.items, 0..) |meta, i| {
+                const start_offset = allocating.written().len;
+
+                try serialize_metadata(&allocating.writer, meta);
+
+                offsets[i] = OffsetEntry{
+                    .offset = @intCast(start_offset),
+                    .length = @intCast(allocating.written().len - start_offset),
+                    ._padding = 0,
+                };
+            }
+
+            const header_size: u64 = @sizeOf(Header);
+            const vectors_size: u64 = count * dim * @sizeOf(f32);
+            const ids_size: u64 = count * @sizeOf(u64);
+            const offset_table_pos = header_size + vectors_size + ids_size;
+            const blob_pos = offset_table_pos + (count * @sizeOf(OffsetEntry));
+
             const header = Header{
                 .magic = MAGIC_NUMBER,
                 .version = 1,
                 .dim = @intCast(dim),
-                .count = self.ids.items.len,
+                ._padding = 0,
+                .count = count,
+                .offset_table_pos = offset_table_pos,
+                .blob_pos = blob_pos,
             };
 
             try file.writeAll(std.mem.asBytes(&header));
-
-            const vector_bytes = std.mem.sliceAsBytes(self.vectors.items);
-            try file.writeAll(vector_bytes);
-
-            const id_bytes = std.mem.sliceAsBytes(self.ids.items);
-            try file.writeAll(id_bytes);
+            try file.writeAll(std.mem.sliceAsBytes(self.vectors.items));
+            try file.writeAll(std.mem.sliceAsBytes(self.ids.items));
+            try file.writeAll(std.mem.sliceAsBytes(offsets));
+            try file.writeAll(allocating.written());
         }
 
         pub fn load(allocator: std.mem.Allocator, path: []const u8) !Self {
@@ -326,9 +432,37 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
             const id_bytes_read = try file.readAll(id_bytes);
             if (id_bytes_read != id_bytes.len) return error.UnexpectedEndOfFile;
 
+            const offsets = try allocator.alloc(OffsetEntry, count);
+            defer allocator.free(offsets);
+
+            const offset_bytes = std.mem.sliceAsBytes(offsets);
+            const offset_bytes_read = try file.readAll(offset_bytes);
+            if (offset_bytes_read != offset_bytes.len) return error.UnexpectedEndOfFile;
+
             try db.metadatas.resize(allocator, count);
-            const empty_metadata: []const MetadataPair = &.{};
-            for (db.metadatas.items) |*m| m.* = empty_metadata;
+
+            for (offsets, 0..) |entry, i| {
+                if (entry.length == 0) {
+                    db.metadatas.items[i] = &.{};
+                    continue;
+                }
+
+                try file.seekTo(header.blob_pos + entry.offset);
+
+                // Read the raw bytes for this metadata entry
+                const meta_bytes = try allocator.alloc(u8, entry.length);
+                defer allocator.free(meta_bytes);
+                const meta_read = try file.readAll(meta_bytes);
+                if (meta_read != entry.length) return error.UnexpectedEndOfFile;
+
+                // Create a Reader from the byte slice
+                var reader = std.io.Reader.fixed(meta_bytes);
+                db.metadatas.items[i] = try deserialize_metadata(&reader, db.arena.allocator());
+            }
+
+            // try db.metadatas.resize(allocator, count);
+            // const empty_metadata: []const MetadataPair = &.{};
+            // for (db.metadatas.items) |*m| m.* = empty_metadata;
 
             var max_id: u64 = 0;
             for (db.ids.items) |id| max_id = @max(max_id, id);
@@ -370,7 +504,7 @@ pub fn main() !void {
         for (0..dim) |j| {
             raw[j] = rand.float(f32) * 2.0 - 1.0;
         }
-        try db.add(raw, empty_metadata);
+        _ = try db.add(raw, empty_metadata);
     }
 
     print("Saving...\n", .{});
@@ -642,4 +776,96 @@ test "search_filtered filters by different metadata" {
 
         try std.testing.expectEqual(@as(usize, 0), results.len);
     }
+}
+
+test "save and load preserves all metadata value types" {
+    const allocator = std.testing.allocator;
+    const DB = VectorDB(4, .Cosine);
+
+    var db = DB.init(allocator);
+    defer db.deinit();
+
+    _ = try db.add(.{ 1, 0, 0, 0 }, &.{
+        .{ .key = "title", .value = .{ .string = "Hello World" } },
+        .{ .key = "views", .value = .{ .integer = 12345 } },
+        .{ .key = "published", .value = .{ .boolean = true } },
+    });
+    _ = try db.add(.{ 0, 1, 0, 0 }, &.{});
+    _ = try db.add(.{ 0, 0, 1, 0 }, &.{
+        .{ .key = "draft", .value = .{ .boolean = false } },
+        .{ .key = "score", .value = .{ .integer = -42 } },
+    });
+
+    const test_path = "test_metadata_roundtrip.elq";
+    try db.save(test_path);
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var loaded = try DB.load(allocator, test_path);
+    defer loaded.deinit();
+
+    const meta0 = loaded.metadatas.items[0];
+    try std.testing.expectEqual(3, meta0.len);
+    try std.testing.expectEqualStrings("title", meta0[0].key);
+    try std.testing.expectEqualStrings("Hello World", meta0[0].value.string);
+    try std.testing.expectEqualStrings("views", meta0[1].key);
+    try std.testing.expectEqual(12345, meta0[1].value.integer);
+    try std.testing.expectEqualStrings("published", meta0[2].key);
+    try std.testing.expectEqual(true, meta0[2].value.boolean);
+
+    try std.testing.expectEqual(0, loaded.metadatas.items[1].len);
+
+    const meta2 = loaded.metadatas.items[2];
+    try std.testing.expectEqual(2, meta2.len);
+    try std.testing.expectEqual(false, meta2[0].value.boolean);
+    try std.testing.expectEqual(-42, meta2[1].value.integer);
+}
+
+test "search_filtered works after load" {
+    const allocator = std.testing.allocator;
+    const DB = VectorDB(4, .DotProduct);
+
+    var db = DB.init(allocator);
+    defer db.deinit();
+
+    const pub_id = try db.add(.{ 1, 0, 0, 0 }, &.{
+        .{ .key = "status", .value = .{ .string = "published" } },
+    });
+    _ = try db.add(.{ 0.9, 0.1, 0, 0 }, &.{
+        .{ .key = "status", .value = .{ .string = "draft" } },
+    });
+
+    const test_path = "test_filter_after_load.elq";
+    try db.save(test_path);
+    defer std.fs.cwd().deleteFile(test_path) catch {};
+
+    var loaded = try DB.load(allocator, test_path);
+    defer loaded.deinit();
+
+    const filter: []const Condition = &.{
+        .{ .eq = .{ .key = "status", .value = .{ .string = "published" } } },
+    };
+    const results = try loaded.search_filtered(.{ 1, 0, 0, 0 }, 10, filter);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(1, results.len);
+    try std.testing.expectEqual(pub_id, results[0].id);
+}
+
+test "metadata validation enforces limits" {
+    try std.testing.expectError(
+        error.MetadataEmptyKey,
+        validate_metadata(&.{.{ .key = "", .value = .{ .boolean = true } }}),
+    );
+
+    const long_key = "a" ** (MAX_KEY_LEN + 1);
+    try std.testing.expectError(
+        error.MetadataKeyTooLong,
+        validate_metadata(&.{.{ .key = long_key, .value = .{ .boolean = true } }}),
+    );
+
+    const long_string = "x" ** (MAX_STRING_LEN + 1);
+    try std.testing.expectError(
+        error.MetadataStringTooLong,
+        validate_metadata(&.{.{ .key = "k", .value = .{ .string = long_string } }}),
+    );
 }
