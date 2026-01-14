@@ -142,6 +142,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const fmt_cmd = b.addSystemCommand(&.{ "zig", "fmt", "build.zig", "src" });
+    const fmt_step = b.step("fmt", "Format source files");
+    fmt_step.dependOn(&fmt_cmd.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

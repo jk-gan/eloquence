@@ -1,5 +1,12 @@
-//! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+
+const vector_db = @import("vector_db.zig");
+
+pub const Value = vector_db.Value;
+pub const MetadataPair = vector_db.MetadataPair;
+pub const Condition = vector_db.Condition;
+pub const DistanceMetric = vector_db.DistanceMetric;
+pub const VectorDB = vector_db.VectorDB;
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
