@@ -21,6 +21,10 @@ Eloquence is a personal journey into understanding how vector databases work und
 ## Current Features
 
 - ✅ **In-memory vector storage** with dynamic capacity
+- ✅ **Persistent Storage**: Save and load database state to disk custom binary format
+- ✅ **Metadata Support**:
+  - Filter by Key existence (`has`)
+  - Filter by Exact Match (`eq`) for Strings, Integers, and Booleans
 - ✅ **Multiple distance metrics**:
   - **Cosine Similarity** — Vectors are normalized, then dot product is computed
   - **Dot Product** — Raw dot product without normalization
@@ -48,6 +52,7 @@ zig build run
 
 ```
 Inserting 5,000 random vectors...
+Saving...
 Searching top 10 neighbors...
 Rank 1 → id: 4000, score: 0.999998
 Rank 2 → id: 2847, score: 0.142853
@@ -59,31 +64,44 @@ Rank 3 → id: 1923, score: 0.139421
 
 ```zig
 const std = @import("std");
-
-// Import or define VectorDB...
+const eloquence = @import("eloquence");
 
 pub fn main() !void {
     const dim = 128;  // Vector dimension
-    const DB = VectorDB(dim, .Cosine);  // Choose your distance metric
+    const DB = eloquence.VectorDB(dim, .Cosine);
+    const MetadataPair = eloquence.MetadataPair;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize DB
     var db = DB.init(allocator);
     defer db.deinit();
 
-    // Add vectors
-    const my_vector: @Vector(dim, f32) = // ... your vector data
-    try db.add(1, my_vector);
+    // 1. Add vectors with metadata
+    const my_vector: @Vector(dim, f32) = .{ ... }; // your 128d vector
+    const metadata = &.{
+        .{ .key = "category", .value = .{ .string = "science" } },
+        .{ .key = "published", .value = .{ .boolean = true } },
+    };
+    
+    // IDs are auto-generated
+    const id = try db.add(my_vector, metadata);
 
-    // Search for similar vectors
-    const results = try db.search(query_vector, 10);  // Top 10
+    // 2. Save to disk
+    try db.save("my_db.elq");
+
+    // 3. Search
+    const results = try db.search(query_vector, 10);
     defer allocator.free(results);
 
-    for (results) |result| {
-        std.debug.print("ID: {}, Score: {d:.4}\n", .{ result.id, result.score });
-    }
+    // 4. Search with Filters
+    const filter = &.{
+        .{ .eq = .{ .key = "category", .value = .{ .string = "science" } } }
+    };
+    const filtered_results = try db.search_filtered(query_vector, 10, filter);
+    defer allocator.free(filtered_results);
 }
 ```
 
@@ -93,8 +111,8 @@ pub fn main() !void {
 - [x] Basic vector storage
 - [x] Cosine similarity search
 - [x] Multiple distance metrics
-- [ ] Persistence (save/load to disk)
-- [ ] Metadata storage & filtering
+- [x] Persistence (save/load to disk)
+- [x] Metadata storage & filtering
 
 ### Phase 2: Indexing (The Heart of Vector DBs)
 - [ ] **IVF** (Inverted File Index) — Clustering-based ANN
@@ -118,6 +136,10 @@ fn dot(comptime dim: usize, a: @Vector(dim, f32), b: @Vector(dim, f32)) f32 {
     return @reduce(.Add, a * b);  // SIMD multiply + horizontal add
 }
 ```
+
+### Metadata & Persistence
+
+Metadata is stored alongside vectors using a custom binary format (`.elq`). It supports efficient filtering by scanning metadata corresponding to vectors before computing distance scores. Constraints (max keys, max size) are enforced to maintain performance predictability.
 
 ### Cosine Similarity Optimization
 
