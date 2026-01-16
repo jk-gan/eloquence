@@ -41,14 +41,73 @@ pub fn KMeans(comptime dim: usize) type {
             var prng = std.Random.DefaultPrng.init(112233);
             const random = prng.random();
 
-            const indices = try self.allocator.alloc(usize, vectors.len);
-            defer self.allocator.free(indices);
+            // vectors = [v₀, v₁, v₂, v₃, v₄]   k = 3
+            //
+            // Step 1: Pick v₂ randomly
+            //         centroids = [v₂]
+            //
+            // Step 2: Compute D² (distance to v₂):
+            //         D² = [4.0, 1.0, 0.0, 9.0, 16.0]
+            //               │     │    │     │     └── v₄ is far (16)
+            //               │     │    │     └── v₃ is far (9)
+            //               │     │    └── v₂ is the centroid (0)
+            //               │     └── v₁ is close (1)
+            //               └── v₀ is medium (4)
+            //
+            //         total = 4 + 1 + 0 + 9 + 16 = 30
+            //         threshold = random(0, 30) → say 22
+            //
+            //         cumulative: 4 → 5 → 5 → 14 → 30
+            //                                    ↑
+            //                     14 < 22, but 30 ≥ 22 → pick v₄!
+            //
+            //         centroids = [v₂, v₄]
+            //
+            // Step 3: Compute D² (distance to NEAREST of v₂ or v₄):
+            //         D²[i] = min(dist(vᵢ, v₂), dist(vᵢ, v₄))
+            //
+            //         D² = [3.0, 1.0, 0.0, 2.0, 0.0]
+            //         total = 6
+            //         threshold = random(0, 6) → say 4.5
+            //
+            //         cumulative: 3 → 4 → 4 → 6
+            //                               ↑
+            //                     4 < 4.5, but 6 ≥ 4.5 → pick v₃!
+            //
+            //         centroids = [v₂, v₄, v₃]
+            //
+            // Done! 3 well-spread centroids.
+            const min_distances_squared = try self.allocator.alloc(f32, vectors.len);
+            defer self.allocator.free(min_distances_squared);
 
-            for (indices, 0..) |*index, i| index.* = i;
-            random.shuffle(usize, indices);
+            const first_idx = random.intRangeLessThan(usize, 0, vectors.len);
+            centroids[0] = vectors[first_idx];
 
-            for (centroids, 0..) |*c, i| {
-                c.* = vectors[indices[i]];
+            for (1..self.k) |i| {
+                var total: f32 = 0.0;
+
+                for (vectors, 0..) |vec, j| {
+                    var min_distance_squared: f32 = distance_squared(vec, centroids[0]);
+                    for (centroids[0..i]) |centroid| {
+                        const d = distance_squared(vec, centroid);
+                        min_distance_squared = math.min(min_distance_squared, d);
+                    }
+                    min_distances_squared[j] = min_distance_squared;
+                    total += min_distance_squared;
+                }
+
+                const threshold = random.float(f32) * total;
+                var cumulative: f32 = 0.0;
+                var selected: usize = vectors.len - 1; // fallback to the last vector
+                for (min_distances_squared, 0..) |d_sq, k| {
+                    cumulative += d_sq;
+                    if (cumulative >= threshold) {
+                        selected = k;
+                        break;
+                    }
+                }
+
+                centroids[i] = vectors[selected];
             }
 
             var assignments = try self.allocator.alloc(usize, vectors.len);
