@@ -3,6 +3,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const meta = @import("metadata.zig");
 const storage = @import("storage.zig");
+const ivf = @import("index/ivf.zig");
 
 pub const Value = meta.Value;
 pub const MetadataPair = meta.MetadataPair;
@@ -37,6 +38,25 @@ fn normalize(comptime dim: usize, v: @Vector(dim, f32)) @Vector(dim, f32) {
     return v / @as(@Vector(dim, f32), @splat(n));
 }
 
+// The VectorDB is using Struct of Arrays (SoA) layout:
+// Struct of Arrays (SoA) - what VectorDB uses:
+// ┌─────────────────────────────────────────────────────────┐
+// │  ids:       [1,   2,   3,   4,   5 ]                    │
+// │  vectors:   [v₀,  v₁,  v₂,  v₃,  v₄]                    │
+// │  metadatas: [m₀,  m₁,  m₂,  m₃,  m₄]                    │
+// └─────────────────────────────────────────────────────────┘
+//   Access vector i: vectors[i], ids[i], metadatas[i]
+//
+// Instead of using Array of Structs (AoS) layout:
+// Array of Structs (AoS) - alternative:
+// ┌─────────────────────────────────────────────────────────┐
+// │  entries: [                                             │
+// │    { id: 1, vector: v₀, metadata: m₀ },                 │
+// │    { id: 2, vector: v₁, metadata: m₁ },                 │
+// │    { id: 3, vector: v₂, metadata: m₂ },                 │
+// │    ...                                                  │
+// │  ]                                                      │
+// └─────────────────────────────────────────────────────────┘
 pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
     return struct {
         ids: std.ArrayList(u64),
@@ -46,14 +66,29 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
         arena: std.heap.ArenaAllocator,
         next_id: u64,
 
+        // Optional IVF index for approximate nearest neighbor search
+        // When null, search() uses brute-force; when set, uses IVF
+        ivf_index: ?IVF = null,
+
         const Self = @This();
         const Vec = @Vector(dim, f32);
+        const IVF = ivf.IVFIndex(dim);
 
         pub fn init(allocator: std.mem.Allocator) Self {
-            return .{ .ids = .{}, .vectors = .{}, .metadatas = .{}, .allocator = allocator, .arena = std.heap.ArenaAllocator.init(allocator), .next_id = 1 };
+            return .{
+                .ids = .{},
+                .vectors = .{},
+                .metadatas = .{},
+                .allocator = allocator,
+                .arena = std.heap.ArenaAllocator.init(allocator),
+                .next_id = 1,
+                .ivf_index = null,
+            };
         }
 
         pub fn deinit(self: *Self) void {
+            if (self.ivf_index) |*idx| idx.deinit();
+
             self.ids.deinit(self.allocator);
             self.vectors.deinit(self.allocator);
             self.metadatas.deinit(self.allocator);
@@ -106,20 +141,52 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
             return std.math.order(a.score, b.score);
         }
 
+        // ┌─────────────────────────────────────────────────────────────┐
+        // │  build_index() - Build IVF index for fast approximate search│
+        // │                                                             │
+        // │  After calling this, search() will use IVF instead of       │
+        // │  brute-force. Call again to rebuild after adding vectors.   │
+        // │                                                             │
+        // │  nlist: number of clusters (rule of thumb: 4 × sqrt(N))     │
+        // │  nprobe: clusters to search (higher = more accurate)        │
+        // └─────────────────────────────────────────────────────────────┘
+        pub fn build_index(self: *Self, nlist: usize) !void {
+            if (self.ivf_index) |*idx| idx.deinit();
+
+            self.ivf_index = try IVF.build(
+                self.allocator,
+                self.vectors.items,
+                nlist,
+                100, // kmeans_max_iter
+                1e-4, // kmeans_tolerance
+            );
+        }
+
         pub fn search(self: *Self, raw_query: Vec, k: usize) ![]Result {
+            return self.search_with_nprobe(raw_query, k, 10);
+        }
+
+        // Search with configurable nprobe (only affects IVF, ignored for brute-force)
+        pub fn search_with_nprobe(self: *Self, raw_query: Vec, k: usize, nprobe: usize) ![]Result {
             if (self.vectors.items.len == 0 or k == 0) return try self.allocator.alloc(Result, 0);
 
             const query = if (metric == .Cosine) normalize(dim, raw_query) else raw_query;
+
+            // Use IVF index if available, otherwise brute-force
+            if (self.ivf_index) |*idx| {
+                return self.search_ivf(idx, query, k, nprobe);
+            }
+
+            return self.search_brute_force(query, k);
+        }
+
+        fn search_brute_force(self: *Self, query: Vec, k: usize) ![]Result {
             const PriorityQueue = std.PriorityDequeue(Result, void, compare_score);
 
             var priority_queue = PriorityQueue.init(self.allocator, {});
             defer priority_queue.deinit();
 
             for (self.ids.items, self.vectors.items) |id, vec| {
-                // Normally we can do cosine similarity to find similarity:
-                // cosine(a, b) = dot(a, b) / (||a|| * ||b||)
-                // if we normalize all vectors to unit length, we can just do:
-                // cosine(a, b) = dot(a, b)  ← much faster, no sqrt or division per pair
                 const score = switch (metric) {
                     .Cosine, .DotProduct => dot(dim, query, vec),
                     .Euclidean => euclidean_score(dim, query, vec),
@@ -140,6 +207,27 @@ pub fn VectorDB(comptime dim: usize, comptime metric: DistanceMetric) type {
             while (priority_queue.removeMinOrNull()) |res| {
                 i -= 1;
                 results[i] = res;
+            }
+
+            return results;
+        }
+
+        fn search_ivf(self: *Self, idx: *IVF, query: Vec, k: usize, nprobe: usize) ![]Result {
+            // IVF returns indices into vectors array; we need to convert to ids and scores
+            const ivf_results = try idx.search(query, k, nprobe);
+            defer self.allocator.free(ivf_results);
+
+            var results = try self.allocator.alloc(Result, ivf_results.len);
+            for (ivf_results, 0..) |ivf_res, i| {
+                const vec = self.vectors.items[ivf_res.index];
+                const score = switch (metric) {
+                    .Cosine, .DotProduct => dot(dim, query, vec),
+                    .Euclidean => euclidean_score(dim, query, vec),
+                };
+                results[i] = .{
+                    .id = self.ids.items[ivf_res.index],
+                    .score = score,
+                };
             }
 
             return results;
@@ -628,4 +716,61 @@ test "search_filtered works after load" {
 
     try std.testing.expectEqual(1, results.len);
     try std.testing.expectEqual(pub_id, results[0].id);
+}
+
+test "search with IVF index returns correct results" {
+    const allocator = std.testing.allocator;
+    const DB = VectorDB(2, .Euclidean);
+
+    var db = DB.init(allocator);
+    defer db.deinit();
+
+    const empty: []const MetadataPair = &.{};
+
+    // Create two clear clusters
+    // Cluster A: around (0, 0)
+    const id1 = try db.add(.{ 0.0, 0.0 }, empty);
+    const id2 = try db.add(.{ 0.1, 0.0 }, empty);
+    _ = try db.add(.{ 0.0, 0.1 }, empty);
+
+    // Cluster B: around (10, 10)
+    _ = try db.add(.{ 10.0, 10.0 }, empty);
+    _ = try db.add(.{ 10.1, 10.0 }, empty);
+    _ = try db.add(.{ 10.0, 10.1 }, empty);
+
+    // Build IVF index with 2 clusters
+    try db.build_index(2);
+
+    // Search near cluster A - should find vectors close to origin
+    const results = try db.search_with_nprobe(.{ 0.05, 0.05 }, 2, 1);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(2, results.len);
+    // Results should be from cluster A (ids 1, 2, or 3)
+    try std.testing.expect(results[0].id == id1 or results[0].id == id2);
+}
+
+test "search falls back to brute-force without index" {
+    const allocator = std.testing.allocator;
+    const DB = VectorDB(2, .Euclidean);
+
+    var db = DB.init(allocator);
+    defer db.deinit();
+
+    const empty: []const MetadataPair = &.{};
+    const id1 = try db.add(.{ 0.0, 0.0 }, empty);
+    _ = try db.add(.{ 10.0, 10.0 }, empty);
+
+    // No index built - should use brute-force
+    const results = try db.search(.{ 0.0, 0.0 }, 1);
+    defer allocator.free(results);
+
+    try std.testing.expectEqual(1, results.len);
+    try std.testing.expectEqual(id1, results[0].id);
+}
+
+test {
+    _ = @import("metadata.zig");
+    _ = @import("storage.zig");
+    _ = @import("index/ivf.zig");
 }

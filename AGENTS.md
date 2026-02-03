@@ -102,3 +102,11 @@ Before committing changes, always run:
 **Trailers:**
 - If fixing a ticket, use appropriate commit trailers
 - If fixing a regression, add a "Fixes:" trailer with the commit id and title
+
+> A lesson I've learned repeatedly the hard way: the limits of the systems you build are only as large as what's actually tested. 
+All resources on a computer are limited. You allow for 64-bit amounts of <whatever> in your program? Have you actually tested that? 
+If not, put lower limits that error the program and wait until reality forces you to change. 
+Don't operate outside the envelope of reality cause it probably doesn't work.
+-- Mitchell Hashimoto
+
+https://x.com/mitchellh/status/2012301401892995492?s=20
